@@ -1,520 +1,495 @@
 import os
 import time
 import random
-import json
 import logging
-from datetime import datetime
-from decimal import Decimal
+from typing import Optional, List, Dict
+from collections import deque
 
-import requests
-from dotenv import load_dotenv
 from web3 import Web3
-from eth_account import Account
+from web3.middleware import geth_poa_middleware
+from eth_account.signers.local import LocalAccount
 
-# ===========================
-# Logging
-# ===========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("volbot")
-
-# ===========================
-# Env
-# ===========================
-load_dotenv()
-
-BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
-MIN_GWEI = float(os.getenv("MIN_GWEI", "1.2"))          # gás baixo, mas realista na BSC
-GAS_BUFFER = float(os.getenv("GAS_BUFFER", "1.05"))     # 5% buffer em estimativas
-TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS", "0xe08b716fffcc0410da0392500c6a88fe0accd819")
-
-# Viés de tamanho das operações
-POSITION_PCT_MIN = float(os.getenv("POSITION_PCT_MIN", "0.02"))   # 2%
-POSITION_PCT_MAX = float(os.getenv("POSITION_PCT_MAX", "0.03"))   # 3%
-
-# Slippage (para minOut)
-SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.70"))  # 30% (0.70 => aceita 70% do esperado)
-
-# Intervalos/ciclos
-MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "2"))  # frequência do loop (s)
-# janela do hold (min/max) em segundos – curtinha para day-trade/volume
-HOLD_MIN_LO = int(os.getenv("HOLD_MIN_LO", "60"))
-HOLD_MIN_HI = int(os.getenv("HOLD_MIN_HI", "120"))
-# timeout de posição para forçar uma venda parcial se não bateu alvo
-TIMEOUT_LO = int(os.getenv("TIMEOUT_LO", "70"))
-TIMEOUT_HI = int(os.getenv("TIMEOUT_HI", "120"))
-# defasagens entre operações
-INTER_WALLET_GAP_LO = int(os.getenv("INTER_WALLET_GAP_LO", "60"))
-INTER_WALLET_GAP_HI = int(os.getenv("INTER_WALLET_GAP_HI", "120"))
-GLOBAL_COOLDOWN = int(os.getenv("GLOBAL_COOLDOWN", "15"))
-
-# Alvo de lucro
-PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", "1.15"))  # +15%
-
-# Endereços (checksum)
-def to_cs(addr: str) -> str:
-    return Web3.to_checksum_address(addr)
-
-ROUTER_V2 = to_cs(os.getenv("PANCAKE_ROUTER_V2", "0x10ED43C718714eb63d5aA57B78B54704E256024E"))
-WBNB      = to_cs(os.getenv("WBNB_ADDRESS",        "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"))
-USDT      = to_cs(os.getenv("USDT_ADDRESS",        "0x55d398326f99059fF775485246999027B3197955"))
-TOKEN     = to_cs(TOKEN_ADDRESS)
-
-# ===========================
-# Web3
-# ===========================
-w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
-if not w3.is_connected():
-    log.error("Falha ao conectar à BSC mainnet.")
-    raise SystemExit(1)
-log.info("Conectado à BSC mainnet")
-
-# ===========================
-# ABIs
-# ===========================
-PancakeSwapRouterABI = json.loads("""
-[
-  {
-    "type":"function","stateMutability":"payable","name":"swapExactETHForTokensSupportingFeeOnTransferTokens",
-    "inputs":[
-      {"name":"amountOutMin","type":"uint256"},
-      {"name":"path","type":"address[]"},
-      {"name":"to","type":"address"},
-      {"name":"deadline","type":"uint256"}
-    ],"outputs":[]
-  },
-  {
-    "type":"function","stateMutability":"nonpayable","name":"swapExactTokensForETHSupportingFeeOnTransferTokens",
-    "inputs":[
-      {"name":"amountIn","type":"uint256"},
-      {"name":"amountOutMin","type":"uint256"},
-      {"name":"path","type":"address[]"},
-      {"name":"to","type":"address"},
-      {"name":"deadline","type":"uint256"}
-    ],"outputs":[]
-  },
-  {
-    "type":"function","stateMutability":"view","name":"getAmountsOut",
-    "inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],
-    "outputs":[{"name":"amounts","type":"uint256[]"}]
-  }
-]
-""")
-
-ERC20_ABI = json.loads("""
-[
-  {"constant":true,"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-  {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
-  {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
-  {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-  {"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"}
-]
-""")
-
-router = w3.eth.contract(address=ROUTER_V2, abi=PancakeSwapRouterABI)
-token  = w3.eth.contract(address=TOKEN,      abi=ERC20_ABI)
-
-# Token meta
+# Load .env variables
 try:
-    TOKEN_DECIMALS = token.functions.decimals().call()
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(), override=False)
+except Exception:
+    pass
+
+###############################################
+# LOGGING
+###############################################
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger.setLevel(LOG_LEVEL)
+VERBOSE = os.getenv("VERBOSE", "0") in ("1", "true", "TRUE")
+
+def vinfo(msg: str):
+    if VERBOSE:
+        logger.info(msg)
+    else:
+        logger.debug(msg)
+
+###############################################
+# ENV / CONFIG
+###############################################
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed2.defibit.io/")
+TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS", "0x0000000000000000000000000000000000000000")
+ROUTER = Web3.to_checksum_address(os.getenv("PANCAKE_ROUTER_V2", "0x10ED43C718714eb63d5aA57B78B54704E256024E"))
+WBNB = Web3.to_checksum_address(os.getenv("WBNB_ADDRESS", "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"))
+USDT = Web3.to_checksum_address(os.getenv("USDT_ADDRESS", "0x55d398326f99059fF775485246999027B3197955"))
+
+# Timing (in seconds)
+STAGGER_MIN = float(os.getenv("STAGGER_MIN", 3))
+STAGGER_MAX = float(os.getenv("STAGGER_MAX", 6))
+HOLD_MIN = float(os.getenv("HOLD_MIN", 10))
+HOLD_MAX = float(os.getenv("HOLD_MAX", 18))
+
+# Trading
+SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", 0.70))  # 70% for taxed tokens
+POSITION_PCT_MIN = float(os.getenv("POSITION_PCT_MIN", 0.01))  # 1%
+POSITION_PCT_MAX = float(os.getenv("POSITION_PCT_MAX", 0.3))  # Max 30%
+PROFIT_TARGET = 1.05  # 5% profit
+VOLUME_MODE = os.getenv("VOLUME_MODE", "0") in ("1", "true", "TRUE")
+
+# Gas
+MIN_GWEI = float(os.getenv("MIN_GWEI", 1.2))
+GAS_BUFFER = float(os.getenv("GAS_BUFFER", 1.05))
+GAS_RESERVE_BNB = float(os.getenv("GAS_RESERVE_BNB", 0.002))
+
+# Price cache
+PRICE_TTL = int(float(os.getenv("PRICE_TTL", 10)))
+
+# Global for tracking last sale amount
+last_received_bnb = 0
+
+###############################################
+# WEB3
+###############################################
+web3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 20}))
+try:
+    web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    logger.info("Middleware PoA aplicado com sucesso")
+except Exception as e:
+    logger.warning(f"Não foi possível aplicar geth_poa_middleware: {e}")
+
+if not web3.is_connected():
+    raise RuntimeError(f"Falha ao conectar no RPC BSC: {BSC_RPC_URL}")
+
+# ABIs
+ERC20_ABI = [
+    {"name": "decimals", "outputs": [{"type": "uint8"}], "inputs": [], "stateMutability": "view", "type": "function"},
+    {"name": "balanceOf", "outputs": [{"type": "uint256"}], "inputs": [{"name": "owner", "type": "address"}], "stateMutability": "view", "type": "function"},
+    {"name": "allowance", "outputs": [{"type": "uint256"}], "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}], "stateMutability": "view", "type": "function"},
+    {"name": "approve", "outputs": [{"type": "bool"}], "inputs": [{"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}], "stateMutability": "nonpayable", "type": "function"},
+]
+
+ROUTER_ABI = [
+    {
+        "name": "getAmountsOut",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "path", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
+        "outputs": [],
+        "inputs": [
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"}
+        ],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
+        "outputs": [],
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"}
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+]
+
+# Validate TOKEN_ADDRESS
+try:
+    token_contract = web3.eth.contract(address=Web3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
+    # Test contract by calling decimals
+    token_contract.functions.decimals().call()
+except Exception as e:
+    logger.error(f"TOKEN_ADDRESS inválido ({TOKEN_ADDRESS}): {e}")
+    raise ValueError(f"TOKEN_ADDRESS inválido. Configure corretamente no .env")
+
+router = web3.eth.contract(address=ROUTER, abi=ROUTER_ABI)
+
+# Token decimals
+try:
+    TOKEN_DECIMALS = token_contract.functions.decimals().call()
 except Exception:
     TOKEN_DECIMALS = 18
 try:
-    TOKEN_SYMBOL = token.functions.symbol().call()
+    USDT_DECIMALS = web3.eth.contract(address=USDT, abi=ERC20_ABI).functions.decimals().call()
 except Exception:
-    TOKEN_SYMBOL = "TOKEN"
-DECIMAL_FACTOR = 10 ** TOKEN_DECIMALS
+    USDT_DECIMALS = 18
 
-# ===========================
-# DexScreener (preço apenas indicativo)
-# ===========================
-DEXSCREENER_API = f"https://api.dexscreener.com/latest/dex/tokens/{TOKEN}"
-_price_cache = {"t": 0, "v": None, "ttl": 8}
+###############################################
+# PRICE
+###############################################
+_TOKENUSD_CACHE = {"t": 0.0, "v": None}
 
-def get_token_price_usd():
-    now = time.time()
-    if now - _price_cache["t"] <= _price_cache["ttl"] and _price_cache["v"] is not None:
-        return _price_cache["v"]
-    try:
-        r = requests.get(DEXSCREENER_API, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        pair = data.get('pairs', [{}])[0]
-        price = float(pair.get('priceUsd', 0))
-        _price_cache.update({"t": now, "v": price if price > 0 else None})
-        return _price_cache["v"]
-    except Exception as e:
-        log.error(f"Erro DexScreener: {e}")
-        return _price_cache["v"]
-
-# ===========================
-# Carteiras
-# ===========================
-wallets = []
-for i in range(1, 10 + 1):
-    pk = os.getenv(f"WALLET{i}_PRIVATE_KEY")
-    if not pk:
-        continue
-    try:
-        acct = Account.from_key(pk)
-        wallets.append({
-            "private_key": pk,
-            "address": acct.address,
-            "nonce": w3.eth.get_transaction_count(acct.address),
-        })
-        log.info(f"Carteira {i} carregada: {acct.address}")
-    except Exception as e:
-        log.warning(f"Chave privada inválida para WALLET{i}_PRIVATE_KEY: {e}")
-
-if not wallets:
-    log.error("Nenhuma carteira válida no .env.")
-    raise SystemExit(1)
-
-# ===========================
-# Estado por carteira
-# ===========================
-def now() -> float:
+def _now() -> float:
     return time.time()
 
-def jitter(a: int, pct: float = 0.10) -> int:
-    d = int(a * pct)
-    return max(a + random.randint(-d, d), 0)
-
-def gwei_to_wei(g: float) -> int:
-    return Web3.to_wei(g, "gwei")
-
-def get_gas_price() -> int:
+def get_token_price_usd() -> Optional[float]:
+    now = _now()
+    if _TOKENUSD_CACHE["v"] is not None and now - _TOKENUSD_CACHE["t"] <= PRICE_TTL:
+        return _TOKENUSD_CACHE["v"]
     try:
-        # força gas baixo, mas fixo/configurável
-        return gwei_to_wei(MIN_GWEI)
-    except Exception:
-        return gwei_to_wei(1.2)
-
-def bnb_balance(addr: str) -> int:
-    return w3.eth.get_balance(addr)
-
-def token_balance(addr: str) -> int:
-    try:
-        return token.functions.balanceOf(addr).call()
-    except Exception:
-        return 0
-
-def fmt_bnb(wei: int) -> str:
-    return f"{(wei/1e18):.6f}"
-
-def fmt_tok(amt: int) -> str:
-    return f"{(amt/DECIMAL_FACTOR):.6f}"
-
-def approve_if_needed(wallet: dict, needed: int) -> bool:
-    try:
-        allowance = token.functions.allowance(wallet["address"], ROUTER_V2).call()
-        if allowance >= needed:
-            return True
-        # aprova "infinito" para não travar volume
-        max_uint = (1 << 256) - 1
-        tx = token.functions.approve(ROUTER_V2, max_uint).build_transaction({
-            "from": wallet["address"],
-            "gas": 60000,
-            "gasPrice": get_gas_price(),
-            "nonce": wallet["nonce"],
-            "chainId": 56
-        })
-        signed = w3.eth.account.sign_transaction(tx, wallet["private_key"])
-        txh = w3.eth.send_raw_transaction(signed.raw_transaction)
-        rc = w3.eth.wait_for_transaction_receipt(txh)
-        if rc.status != 1:
-            log.error(f"Aprovação revertida: {txh.hex()}")
-            return False
-        wallet["nonce"] += 1
-        return True
+        one = 10 ** TOKEN_DECIMALS
+        usd_out = 0
+        try:
+            usd_out = router.functions.getAmountsOut(one, [Web3.to_checksum_address(TOKEN_ADDRESS), USDT]).call()[-1]
+        except Exception:
+            try:
+                usd_out = router.functions.getAmountsOut(one, [Web3.to_checksum_address(TOKEN_ADDRESS), WBNB, USDT]).call()[-1]
+            except Exception:
+                usd_out = 0
+        if usd_out == 0:
+            logger.warning("Falha ao obter preço do token; usando cache")
+            return _TOKENUSD_CACHE["v"]
+        usd = float(usd_out) / (10 ** USDT_DECIMALS)
+        _TOKENUSD_CACHE.update({"t": now, "v": usd})
+        vinfo(f"Preço do token atualizado: ${usd:.6f}")
+        return usd
     except Exception as e:
-        log.error(f"approve falhou: {e}")
-        return False
+        logger.error(f"Erro ao obter preço do token: {e}")
+        return _TOKENUSD_CACHE["v"]
 
-def best_buy_quote(amount_bnb: int):
-    best = 0
-    best_path = [WBNB, TOKEN]
-    try:
-        a1 = router.functions.getAmountsOut(amount_bnb, [WBNB, TOKEN]).call()[-1]
-        if a1 > best:
-            best = a1
-            best_path = [WBNB, TOKEN]
-    except Exception:
-        pass
-    try:
-        a2 = router.functions.getAmountsOut(amount_bnb, [WBNB, USDT, TOKEN]).call()[-1]
-        if a2 > best:
-            best = a2
-            best_path = [WBNB, USDT, TOKEN]
-    except Exception:
-        pass
-    return best, best_path
+###############################################
+# WALLETS
+###############################################
+def load_wallets_from_env() -> List[LocalAccount]:
+    accs = []
+    for i in range(1, 11):
+        pk = os.getenv(f"WALLET{i}_PRIVATE_KEY")
+        if pk and "your_private_key" not in pk:
+            try:
+                accs.append(web3.eth.account.from_key(pk))
+            except Exception as e:
+                logger.error(f"Chave inválida WALLET{i}: {e}")
+    if not accs:
+        raise RuntimeError("Nenhuma WALLET*_PRIVATE_KEY válida no .env")
+    return accs
 
-def best_sell_quote(amount_token: int):
-    best = 0
-    best_path = [TOKEN, WBNB]
+###############################################
+# TX HELPERS
+###############################################
+def _get_max_priority_fee() -> int:
     try:
-        a1 = router.functions.getAmountsOut(amount_token, [TOKEN, WBNB]).call()[-1]
-        if a1 > best:
-            best = a1
-            best_path = [TOKEN, WBNB]
+        return web3.eth.max_priority_fee
     except Exception:
-        pass
-    try:
-        a2 = router.functions.getAmountsOut(amount_token, [TOKEN, USDT, WBNB]).call()[-1]
-        if a2 > best:
-            best = a2
-            best_path = [TOKEN, USDT, WBNB]
-    except Exception:
-        pass
-    return best, best_path
+        return int(1 * 1e9)  # Fallback to 1 Gwei
 
-def buy(wallet: dict, bnb_amount: int) -> int:
+def _get_base_fee() -> int:
     try:
-        exp_tokens, path = best_buy_quote(bnb_amount)
-        if exp_tokens <= 0:
-            log.error("Sem rota/liquidez para compra.")
-            return 0
-        min_out = int(exp_tokens * SLIPPAGE_TOLERANCE)
-        deadline = int(time.time()) + 600
-        bal_before = token_balance(wallet["address"])
-        tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            min_out, path, wallet["address"], deadline
-        ).build_transaction({
-            "from": wallet["address"],
-            "value": bnb_amount,
-            "gas": 150000,
-            "gasPrice": get_gas_price(),
-            "nonce": wallet["nonce"],
-            "chainId": 56
-        })
-        signed = w3.eth.account.sign_transaction(tx, wallet["private_key"])
-        txh = w3.eth.send_raw_transaction(signed.raw_transaction)
-        rc = w3.eth.wait_for_transaction_receipt(txh)
-        if rc.status != 1:
-            log.error(f"Compra revertida: {txh.hex()}")
-            return 0
-        wallet["nonce"] += 1
-        got = token_balance(wallet["address"]) - bal_before
-        if got <= 0:
-            log.error("Compra executou, mas saldo não aumentou (fee/antibot?).")
-            return 0
-        log.info(f"BUY {wallet['address']}: {fmt_bnb(bnb_amount)} BNB -> {fmt_tok(got)} {TOKEN_SYMBOL} | Tx: {txh.hex()}")
-        return got
+        return web3.eth.get_block('pending')['baseFeePerGas']
+    except Exception:
+        return int(5 * 1e9)  # Fallback to 5 Gwei
+
+def send_tx(tx: dict, account: LocalAccount) -> dict:
+    tx["nonce"] = web3.eth.get_transaction_count(account.address)
+    try:
+        # Estimate gas first
+        gas_est = web3.eth.estimate_gas({**tx, "from": account.address})
+        tx["gas"] = int(gas_est * 1.2)
     except Exception as e:
-        log.error(f"Erro buy: {e}")
-        return 0
+        logger.warning(f"Falha ao estimar gás: {e}. Usando gás padrão de 600000.")
+        tx["gas"] = 600000
 
-def sell(wallet: dict, token_amount: int, reason: str = "") -> int:
-    if token_amount <= 0:
-        return 0
+    # Use EIP-1559 parameters
+    max_priority_fee = _get_max_priority_fee()
+    base_fee = _get_base_fee()
+    tx["maxPriorityFeePerGas"] = int(max_priority_fee * GAS_BUFFER)
+    tx["maxFeePerGas"] = int((base_fee + max_priority_fee) * GAS_BUFFER)
+    tx["type"] = 2  # EIP-1559 transaction type
+
     try:
-        if not approve_if_needed(wallet, token_amount):
-            return 0
-        exp_bnb, path = best_sell_quote(token_amount)
-        if exp_bnb <= 0:
-            log.error("Sem rota/liquidez para venda.")
-            return 0
-        min_out = int(exp_bnb * SLIPPAGE_TOLERANCE)
-        deadline = int(time.time()) + 600
-        bnb_before = bnb_balance(wallet["address"])
-        tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            token_amount, min_out, path, wallet["address"], deadline
-        ).build_transaction({
-            "from": wallet["address"],
-            "gas": 180000,
-            "gasPrice": get_gas_price(),
-            "nonce": wallet["nonce"],
-            "chainId": 56
-        })
-        signed = w3.eth.account.sign_transaction(tx, wallet["private_key"])
-        txh = w3.eth.send_raw_transaction(signed.raw_transaction)
-        rc = w3.eth.wait_for_transaction_receipt(txh)
-        if rc.status != 1:
-            log.error(f"Venda revertida: {txh.hex()}")
-            return 0
-        wallet["nonce"] += 1
-        bnb_after = bnb_balance(wallet["address"])
-        gross = bnb_after - bnb_before
-        log.info(f"SELL {wallet['address']}: {fmt_tok(token_amount)} {TOKEN_SYMBOL} -> gross ~ {fmt_bnb(gross)} BNB | {reason} | Tx: {txh.hex()}")
-        return gross
+        signed = account.sign_transaction(tx)
+        txh = web3.eth.send_raw_transaction(signed.rawTransaction)
+        receipt = web3.eth.wait_for_transaction_receipt(txh, timeout=120)
+        if receipt.status != 1:
+            raise ValueError(f"Transação falhou: {txh.hex()}")
+        return receipt
     except Exception as e:
-        log.error(f"Erro sell: {e}")
+        logger.error(f"Erro ao enviar transação para {account.address[:8]}…: {e}")
+        raise
+
+###############################################
+# TRADES
+###############################################
+def approve_if_needed(account: LocalAccount, spender: str, amount: int) -> Optional[str]:
+    try:
+        allowance = token_contract.functions.allowance(account.address, spender).call()
+        if allowance >= amount:
+            return None
+        logger.info(f"Aprovando {amount/(10**TOKEN_DECIMALS):.4f} tokens para {spender}...")
+        tx = token_contract.functions.approve(spender, 2**256 - 1).build_transaction({
+            "from": account.address,
+        })
+        receipt = send_tx(tx, account)
+        return receipt.transactionHash.hex()
+    except Exception as e:
+        logger.error(f"Erro ao aprovar tokens para {account.address[:8]}…: {e}")
+        return None
+
+def buy_tokens(account: LocalAccount, bnb_wei: int) -> Optional[str]:
+    if bnb_wei <= 0:
+        return None
+    path = [WBNB, Web3.to_checksum_address(TOKEN_ADDRESS)]
+    amount_out_min = 0
+    deadline = int(time.time()) + 60 * 3
+    fn = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+        amount_out_min,
+        path,
+        account.address,
+        deadline,
+    )
+    tx = fn.build_transaction({
+        "from": account.address,
+        "value": bnb_wei,
+    })
+    receipt = send_tx(tx, account)
+    return receipt.transactionHash.hex()
+
+def sell_tokens(account: LocalAccount, amount_in: int) -> Optional[str]:
+    global last_received_bnb
+    if amount_in <= 0:
+        return None
+    approve_txh = approve_if_needed(account, ROUTER, amount_in)
+    if approve_txh:
+        logger.info(f"Approve tx={approve_txh}")
+    old_bnb = web3.eth.get_balance(account.address)
+    path = [Web3.to_checksum_address(TOKEN_ADDRESS), WBNB]
+    amount_out_min = 0
+    deadline = int(time.time()) + 60 * 3
+    fn = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        amount_in,
+        amount_out_min,
+        path,
+        account.address,
+        deadline,
+    )
+    tx = fn.build_transaction({
+        "from": account.address,
+    })
+    receipt = send_tx(tx, account)
+    new_bnb = web3.eth.get_balance(account.address)
+    gas_cost = receipt.gasUsed * receipt.effectiveGasPrice
+    received = new_bnb - old_bnb + gas_cost
+    last_received_bnb = received
+    vinfo(f"Received {received / 1e18:.5f} BNB from sell")
+    return receipt.transactionHash.hex()
+
+def token_balance_of(addr: str) -> int:
+    try:
+        return token_contract.functions.balanceOf(addr).call()
+    except Exception as e:
+        logger.error(f"Erro ao obter saldo de tokens para {addr[:8]}…: {e}")
         return 0
 
-# Estado por carteira
-wallet_state = {}
-for w in wallets:
-    addr = w["address"]
-    tbal = token_balance(addr)
-    bbnb = bnb_balance(addr)
-    log.info(f"Saldo {addr}: {fmt_bnb(bbnb)} BNB | {TOKEN_SYMBOL}: {fmt_tok(tbal)}")
-    wallet_state[addr] = {
-        "avg_buy_price": None,       # preço médio em USD (indicativo)
-        "last_buy_ts": 0.0,
-        "last_sell_ts": 0.0,
-        "min_hold_secs": random.randint(HOLD_MIN_LO, HOLD_MIN_HI),
-        "timeout_secs": random.randint(TIMEOUT_LO, TIMEOUT_HI),
-        "sell_streak": 0,
-        "buy_streak": 0,
-        "next_allowed_ts": 0.0,
+###############################################
+# FIBONACCI
+###############################################
+def fib_gen():
+    a, b = 0, 1
+    while True:
+        yield b
+        a, b = b, a + b
+
+###############################################
+# MAIN LOOP
+###############################################
+def _pick_position_fraction() -> float:
+    lo, hi = sorted((POSITION_PCT_MIN, POSITION_PCT_MAX))
+    return random.uniform(lo, hi)
+
+def run():
+    global last_received_bnb
+    accounts = load_wallets_from_env()
+    logger.info(f"Rodando com {len(accounts)} carteira(s)")
+
+    # Initialize wallet state with sell count
+    state: Dict[str, Dict] = {
+        a.address: {
+            "entry_time": None,
+            "entry_price": None,
+            "sell_count": 0,  # Track number of sells for no-BNB case
+        } for a in accounts
     }
-    # Se já tem posição de token, inicia com um tempo para simular hold
-    if tbal > 0:
-        log.info(f"[BOOTSTRAP] {addr} tem posição inicial ({fmt_tok(tbal)} {TOKEN_SYMBOL}). Hold min ~{wallet_state[addr]['min_hold_secs']}s, timeout ~{wallet_state[addr]['timeout_secs']}s.")
 
-# Cooldown global
-global_next_ts = 0.0
+    # Set initial state for wallets with tokens
+    for acc in accounts:
+        tbal = token_balance_of(acc.address)
+        if tbal > 0:
+            state[acc.address]["entry_time"] = _now()  # Assume tokens were just acquired
+            price = get_token_price_usd()
+            state[acc.address]["entry_price"] = price if price else 0.0
+            vinfo(f"Inicializando {acc.address[:8]}… com {tbal/(10**TOKEN_DECIMALS):.4f} tokens, preço=${price or 'n/a'}")
 
-def can_act(addr: str) -> bool:
-    return now() >= wallet_state[addr]["next_allowed_ts"] and now() >= global_next_ts
+    # Action queue
+    action_queue = deque()
+    buy_fib = fib_gen()
+    for _ in range(2):
+        next(buy_fib)  # Start at 2 buys
+    sell_fib = fib_gen()
+    next(sell_fib)  # Start at 1 sell
 
-def schedule_after(addr: str, lo: int, hi: int):
-    delay = random.randint(lo, hi)
-    wallet_state[addr]["next_allowed_ts"] = now() + delay
-    return delay
+    def refill_queue():
+        buy_count = next(buy_fib)
+        sell_count = next(sell_fib)
+        # Create a mixed action list to avoid strict buy/sell sequences
+        actions = ['buy'] * buy_count + ['sell'] * sell_count
+        random.shuffle(actions)  # Shuffle to ensure non-sequential pattern
+        action_queue.extend(actions)
 
-def schedule_global(cool: int):
-    global global_next_ts
-    global_next_ts = now() + cool
+    refill_queue()
 
-def pick_buy_size(addr: str) -> int:
-    bal = bnb_balance(addr)
-    # reserva ~ 2 * 200k gas * gasPrice
-    gas_reserve = int(200000 * get_gas_price() * 2)
-    if bal <= gas_reserve:
-        return 0
-    frac = random.uniform(POSITION_PCT_MIN, POSITION_PCT_MAX)
-    amt = int((bal - gas_reserve) * frac)
-    # mínimo absoluto
-    min_abs = Web3.to_wei(0.00005, "ether")
-    if amt < min_abs:
-        amt = min_abs if bal - gas_reserve > min_abs else 0
-    return amt
+    while True:
+        if not action_queue:
+            refill_queue()
 
-def try_buy(addr: str, w: dict) -> bool:
-    if not can_act(addr):
-        return False
-    bnb_amt = pick_buy_size(addr)
-    if bnb_amt <= 0:
-        return False
-    got = buy(w, bnb_amt)
-    if got > 0:
-        # atualiza preço médio indicativo
-        px = get_token_price_usd()
-        st = wallet_state[addr]
-        if px:
-            if st["avg_buy_price"] is None:
-                st["avg_buy_price"] = px
-            else:
-                # média móvel simples (peso 0.5)
-                st["avg_buy_price"] = (st["avg_buy_price"] + px) / 2.0
-        st["last_buy_ts"] = now()
-        st["buy_streak"] += 1
-        st["sell_streak"] = 0
-        # agenda próximos
-        schedule_after(addr, INTER_WALLET_GAP_LO, INTER_WALLET_GAP_HI)
-        schedule_global(GLOBAL_COOLDOWN)
-        return True
-    return False
+        action = action_queue.popleft()
 
-def try_sell(addr: str, w: dict, reason: str) -> bool:
-    if not can_act(addr):
-        return False
-    tbal = token_balance(addr)
-    if tbal <= 0:
-        return False
-    # vende parcial (ondas) 75–95%
-    frac = random.uniform(0.75, 0.95)
-    amount = max(int(tbal * frac), 1)
-    gross = sell(w, amount, reason=reason)
-    if gross > 0:
-        st = wallet_state[addr]
-        st["last_sell_ts"] = now()
-        st["sell_streak"] += 1
-        # reduzir buy_streak (não zera totalmente p/ manter viés pró-compra quando possível)
-        st["buy_streak"] = max(st["buy_streak"] - 1, 0)
-        # agenda próximos
-        schedule_after(addr, INTER_WALLET_GAP_LO, INTER_WALLET_GAP_HI)
-        schedule_global(GLOBAL_COOLDOWN)
-        # mantém resto de saldo pra próxima onda
-        rem = token_balance(addr)
-        log.info(f"[WAVE] Venda PARCIAL {addr}: frac={frac:.3f}, remanescente ~ {fmt_tok(rem)} {TOKEN_SYMBOL}")
-        return True
-    return False
+        # Find eligible wallets
+        candidates = []
+        for acc in accounts:
+            addr = acc.address
+            tbal = token_balance_of(addr)
+            bnb_bal = web3.eth.get_balance(addr)
+            spendable = max(0, bnb_bal - int(GAS_RESERVE_BNB * 1e18))
+            entry_time = state[addr].get("entry_time")
+            age = _now() - entry_time if entry_time else 0
+            if action == 'buy' and spendable > 0:
+                candidates.append((acc, spendable))
+            elif action == 'sell' and tbal > 0:
+                candidates.append((acc, tbal))
 
-def must_buy_bias(addr: str) -> bool:
-    """
-    Regras de viés pró-compra:
-      - Se sell_streak >= 2 => deve comprar até buy_streak >= 2.
-      - Se não vendeu recentemente, pode comprar mesmo tendo pequenos restos de saldo.
-    """
-    st = wallet_state[addr]
-    if st["sell_streak"] >= 2 and st["buy_streak"] < 2:
-        return True
-    return False
+        if not candidates and action == 'buy':
+            # No BNB available, try to sell tokens
+            sell_candidates = [(acc, token_balance_of(acc.address)) for acc in accounts if token_balance_of(acc.address) > 0]
+            if sell_candidates:
+                acc, tbal = random.choice(sell_candidates)
+                addr = acc.address
+                sell_percentage = 0.4 if state[addr]["sell_count"] == 0 else 0.3  # 40% first, then 30%
+                amount_in = int(tbal * sell_percentage)
+                if amount_in > 0:
+                    vinfo(f"{addr[:8]}… vendendo {sell_percentage*100:.0f}% ({amount_in/(10**TOKEN_DECIMALS):.4f}) tokens por falta de BNB")
+                    try:
+                        txh = sell_tokens(acc, amount_in)
+                        if txh:
+                            logger.info(f"SELL {addr[:8]}… tx={txh}")
+                            state[addr]["entry_time"] = None
+                            state[addr]["entry_price"] = None
+                            state[addr]["sell_count"] += 1
+                            if state[addr]["sell_count"] < 2:
+                                action_queue.appendleft('sell')  # Queue another sell if not done
+                            performed = True
+                    except Exception as e:
+                        logger.error(f"Erro ao vender para {addr[:8]}…: {e}")
+                    time.sleep(random.uniform(STAGGER_MIN, STAGGER_MAX))
+                    continue
+            logger.warning(f"Sem carteira disponível para {action} e sem tokens para vender:")
+            for acc in accounts:
+                addr = acc.address
+                tbal = token_balance_of(addr)
+                bnb_bal = web3.eth.get_balance(addr)
+                spendable = max(0, bnb_bal - int(GAS_RESERVE_BNB * 1e18))
+                age = (_now() - state[addr].get("entry_time", _now())) if state[addr].get("entry_time") else 0
+                logger.warning(f"  {addr[:8]}… BNB={bnb_bal/1e18:.5f}, Tokens={tbal/(10**TOKEN_DECIMALS):.4f}, Age={int(age)}s")
+            time.sleep(5)
+            continue
 
-def price_target_hit(addr: str) -> bool:
-    px = get_token_price_usd()
-    st = wallet_state[addr]
-    return (px is not None) and (st["avg_buy_price"] is not None) and (px >= st["avg_buy_price"] * PROFIT_TARGET)
+        if not candidates:
+            logger.warning(f"Sem carteira disponível para {action}:")
+            for acc in accounts:
+                addr = acc.address
+                tbal = token_balance_of(addr)
+                bnb_bal = web3.eth.get_balance(addr)
+                spendable = max(0, bnb_bal - int(GAS_RESERVE_BNB * 1e18))
+                age = (_now() - state[addr].get("entry_time", _now())) if state[addr].get("entry_time") else 0
+                logger.warning(f"  {addr[:8]}… BNB={bnb_bal/1e18:.5f}, Tokens={tbal/(10**TOKEN_DECIMALS):.4f}, Age={int(age)}s")
+            time.sleep(5)
+            continue
 
-def hold_timeout(addr: str) -> bool:
-    st = wallet_state[addr]
-    last_buy = st["last_buy_ts"]
-    if last_buy == 0:
-        return False
-    return (now() - last_buy) >= st["timeout_secs"]
+        # Pick random wallet
+        acc, amount = random.choice(candidates)
+        addr = acc.address
+        performed = False
 
-def hold_min_elapsed(addr: str) -> bool:
-    st = wallet_state[addr]
-    last_buy = st["last_buy_ts"]
-    if last_buy == 0:
-        # se nunca comprou nesta sessão, pode vender se tiver saldo inicial (mas o viés pró-compra segura isso)
-        return True
-    return (now() - last_buy) >= st["min_hold_secs"]
+        try:
+            price = get_token_price_usd() if not VOLUME_MODE else None
 
-def maybe_reset_random_timers(addr: str):
-    # Aleatoriza novamente as janelas para evitar sincronizar
-    wallet_state[addr]["min_hold_secs"] = random.randint(HOLD_MIN_LO, HOLD_MIN_HI)
-    wallet_state[addr]["timeout_secs"]  = random.randint(TIMEOUT_LO, TIMEOUT_HI)
+            if action == 'buy':
+                to_spend = int(last_received_bnb * 1.05) if last_received_bnb > 0 else int(amount * _pick_position_fraction())
+                to_spend = min(to_spend, int(amount * 0.3))  # Max 30% of BNB
+                if to_spend <= 0:
+                    logger.warning(f"{addr[:8]}… sem BNB suficiente para comprar")
+                    continue
+                vinfo(f"{addr[:8]}… comprando com {to_spend/1e18:.5f} BNB")
+                txh = buy_tokens(acc, to_spend)
+                if txh:
+                    logger.info(f"BUY {addr[:8]}… tx={txh}")
+                    state[addr]["entry_time"] = _now()
+                    state[addr]["entry_price"] = price if price else 0.0
+                    state[addr]["sell_count"] = 0  # Reset sell count after buy
+                    performed = True
 
-# ===========================
-# Loop principal
-# ===========================
-rr = 0
-while True:
-    price = get_token_price_usd()
-    if price:
-        log.info(f"Preço aprox (USD) ~ {price:.8f}")
-    # percorre apenas UMA carteira por iteração para manter defasagem
-    w = wallets[rr % len(wallets)]
-    rr += 1
-    addr = w["address"]
-    st = wallet_state[addr]
-    tbal = token_balance(addr)
+            elif action == 'sell':
+                amount_in = int(amount * random.uniform(0.3, 0.4))  # Random 30-40%
+                if amount_in <= 0:
+                    logger.warning(f"{addr[:8]}… sem tokens suficientes para vender")
+                    continue
+                age = _now() - state[addr]["entry_time"] if state[addr]["entry_time"] else 0
+                sell_now = age >= HOLD_MIN if VOLUME_MODE else age >= HOLD_MAX
+                if not VOLUME_MODE and price and state[addr]["entry_price"] and state[addr]["entry_price"] > 0:
+                    if price >= state[addr]["entry_price"] * PROFIT_TARGET:
+                        sell_now = True
+                if not sell_now:
+                    vinfo(f"{addr[:8]}… segurando; preço_atual={'{:.6f}'.format(price) if price else 'n/a'}, entry={'{:.6f}'.format(state[addr]['entry_price']) if state[addr]['entry_price'] else 'n/a'}, age={int(age)}s")
+                    continue
+                vinfo(f"{addr[:8]}… vendendo {amount_in/(10**TOKEN_DECIMALS):.4f} tokens")
+                txh = sell_tokens(acc, amount_in)
+                if txh:
+                    logger.info(f"SELL {addr[:8]}… tx={txh}")
+                    state[addr]["entry_time"] = None
+                    state[addr]["entry_price"] = None
+                    state[addr]["sell_count"] += 1
+                    performed = True
 
-    # 1) Se viés manda comprar (após 2 vendas seguidas), prioriza BUY mesmo tendo resto de token
-    if must_buy_bias(addr):
-        acted = try_buy(addr, w)
-        if acted:
-            maybe_reset_random_timers(addr)
-    else:
-        # 2) Caso tenha token, verifica alvo/timeout, mas só vende se já passou hold mínimo
-        acted = False
-        if tbal > 0 and hold_min_elapsed(addr):
-            if price_target_hit(addr):
-                acted = try_sell(addr, w, reason="alvo atingido")
-                if acted:
-                    maybe_reset_random_timers(addr)
-            elif hold_timeout(addr):
-                acted = try_sell(addr, w, reason="timeout")
-                if acted:
-                    maybe_reset_random_timers(addr)
+        except Exception as e:
+            logger.error(f"Erro em {action} para {addr[:8]}…: {e}")
 
-        # 3) Se não vendeu (ou se não tinha saldo), tenta comprar
-        if not acted:
-            acted = try_buy(addr, w)
-            if acted:
-                maybe_reset_random_timers(addr)
+        if performed:
+            sleep_time = random.uniform(STAGGER_MIN, STAGGER_MAX)
+            vinfo(f"Dormindo {int(sleep_time)}s após transação")
+            time.sleep(sleep_time)
+        else:
+            time.sleep(5)
 
-    time.sleep(MONITOR_INTERVAL)
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        logger.info("Encerrado pelo usuário")
